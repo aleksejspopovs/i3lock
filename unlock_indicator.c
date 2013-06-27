@@ -180,7 +180,7 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
         struct tm *tm = localtime(&curtime);
         strftime(text, 100, INFO_TIME_FORMAT, tm);
 
-        cairo_set_source_rgb(ctx, 0, 0, 0);
+        cairo_set_source_rgb(ctx, 255, 255, 255);
         cairo_set_font_size(ctx, 32.0);
 
         cairo_text_extents_t time_extents;
