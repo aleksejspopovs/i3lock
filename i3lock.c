@@ -607,7 +607,8 @@ int main(int argc, char *argv[]) {
      * visible to the user, we should make sure that we're not using rand()
      * for anything important (spoiler: we aren't). */
     time_t curtime = time(NULL);
-    lock_time = localtime(&curtime);
+    lock_time = malloc(sizeof(struct tm));
+    localtime_r(&curtime, lock_time);
 
     /* Initialize PAM */
     ret = pam_start("i3lock", username, &conv, &pam_handle);
