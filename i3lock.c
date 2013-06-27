@@ -61,6 +61,9 @@ static struct xkb_keymap *xkb_keymap;
 cairo_surface_t *img = NULL;
 bool tile = false;
 
+int failed_attempts = 0;
+struct tm *lock_time;
+
 /* isutf, u8_dec © 2005 Jeff Bezanson, public domain */
 #define isutf(c) (((c) & 0xC0) != 0x80)
 
@@ -200,6 +203,8 @@ static void input_done(void) {
         clear_password_memory();
         exit(0);
     }
+
+    failed_attempts += 1;
 
     if (debug_mode)
         fprintf(stderr, "Authentication failure\n");
@@ -596,6 +601,13 @@ int main(int argc, char *argv[]) {
     /* We need (relatively) random numbers for highlighting a random part of
      * the unlock indicator upon keypresses. */
     srand(time(NULL));
+
+    /* We need to save the current time in order to display the time when
+     * the computer was locked. Since this could lead to our PRNG seed being
+     * visible to the user, we should make sure that we're not using rand()
+     * for anything important (spoiler: we aren't). */
+    time_t curtime = time(NULL);
+    lock_time = localtime(&curtime);
 
     /* Initialize PAM */
     ret = pam_start("i3lock", username, &conv, &pam_handle);

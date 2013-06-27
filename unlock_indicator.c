@@ -7,6 +7,7 @@
  *
  */
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <xcb/xcb.h>
@@ -22,6 +23,10 @@
 #define BUTTON_SPACE (BUTTON_RADIUS + 5)
 #define BUTTON_CENTER (BUTTON_RADIUS + 5)
 #define BUTTON_DIAMETER (2 * BUTTON_SPACE)
+#define INFO_MAXLENGTH 100
+#define INFO_TIME_FORMAT "%H:%M"
+#define INFO_LOCKTIME_FORMAT "%H:%M"
+#define INFO_MARGIN 12
 
 /*******************************************************************************
  * Variables defined in i3lock.c.
@@ -50,6 +55,12 @@ extern cairo_surface_t *img;
 extern bool tile;
 /* The background color to use (in hex). */
 extern char color[7];
+
+/* How many times has the user failed to authenticate. */
+extern int failed_attempts;
+
+/* When was the computer locked. */
+extern struct tm *lock_time;
 
 /*******************************************************************************
  * Local variables.
@@ -162,34 +173,67 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
 
         cairo_set_line_width(ctx, 10.0);
 
-        /* Display a (centered) text of the current PAM state. */
-        char *text = NULL;
-        switch (pam_state) {
-            case STATE_PAM_VERIFY:
-                text = "verifying…";
-                break;
-            case STATE_PAM_WRONG:
-                text = "wrong!";
-                break;
-            default:
-                break;
+        /* Display some useful information. */
+        /* Time (centered) */
+        char *text = malloc(INFO_MAXLENGTH);
+        time_t curtime = time(NULL);
+        struct tm *tm = localtime(&curtime);
+        strftime(text, 100, INFO_TIME_FORMAT, tm);
+
+        cairo_set_source_rgb(ctx, 0, 0, 0);
+        cairo_set_font_size(ctx, 32.0);
+
+        cairo_text_extents_t time_extents;
+        double time_x, time_y;
+        cairo_text_extents(ctx, text, &time_extents);
+        time_x = BUTTON_CENTER - ((time_extents.width / 2) + time_extents.x_bearing);
+        time_y = BUTTON_CENTER - ((time_extents.height / 2) + time_extents.y_bearing);
+
+        cairo_move_to(ctx, time_x, time_y);
+        cairo_show_text(ctx, text);
+        cairo_close_path(ctx);
+
+        free(text);
+
+        /* Failed attempts (below) */
+        if (failed_attempts == 0) {
+            text = "No failed attempts.";
+        } else if ((failed_attempts % 10 == 1) && (failed_attempts % 100 != 11)) {
+            text = malloc(INFO_MAXLENGTH);
+            snprintf(text, INFO_MAXLENGTH, "%i failed attempt.", failed_attempts);
+        } else {
+            text = malloc(INFO_MAXLENGTH);
+            snprintf(text, INFO_MAXLENGTH, "%i failed attempts.", failed_attempts);
         }
 
-        if (text) {
-            cairo_text_extents_t extents;
-            double x, y;
+        cairo_set_font_size(ctx, 14.0);
 
-            cairo_set_source_rgb(ctx, 0, 0, 0);
-            cairo_set_font_size(ctx, 28.0);
+        double x, y;
+        cairo_text_extents_t extents;
+        cairo_text_extents(ctx, text, &extents);
+        x = BUTTON_CENTER - ((extents.width / 2) + extents.x_bearing);
+        y = time_y - extents.y_bearing + INFO_MARGIN;
 
-            cairo_text_extents(ctx, text, &extents);
-            x = BUTTON_CENTER - ((extents.width / 2) + extents.x_bearing);
-            y = BUTTON_CENTER - ((extents.height / 2) + extents.y_bearing);
+        cairo_move_to(ctx, x, y);
+        cairo_show_text(ctx, text);
+        cairo_close_path(ctx);
 
-            cairo_move_to(ctx, x, y);
-            cairo_show_text(ctx, text);
-            cairo_close_path(ctx);
-        }
+        if (failed_attempts > 0)
+            free(text);
+
+        /* Lock time (above) */
+        text = malloc(INFO_MAXLENGTH);
+        strftime(text, INFO_MAXLENGTH, "Locked since " INFO_LOCKTIME_FORMAT ".", lock_time);
+
+        cairo_text_extents(ctx, text, &extents);
+        x = BUTTON_CENTER - ((extents.width / 2) + extents.x_bearing);
+        y = time_y + time_extents.y_bearing - INFO_MARGIN;
+
+        cairo_move_to(ctx, x, y);
+        cairo_show_text(ctx, text);
+        cairo_close_path(ctx);
+
+        free(text);
 
         /* After the user pressed any valid key or the backspace key, we
          * highlight a random part of the unlock indicator to confirm this
