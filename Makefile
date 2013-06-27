@@ -19,7 +19,7 @@ LIBS += -lev
 FILES:=$(wildcard *.c)
 FILES:=$(FILES:.c=.o)
 
-VERSION:=$(shell git describe --tags --abbrev=0)
+VERSION:=$(shell git describe --tags --abbrev=0)-custom
 GIT_VERSION:="$(shell git describe --tags --always) ($(shell git log --pretty=format:%cd --date=short -n1))"
 CPPFLAGS += -DVERSION=\"${GIT_VERSION}\"
 
