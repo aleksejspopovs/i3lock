@@ -198,9 +198,8 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
         /* Failed attempts (below) */
         if (failed_attempts == 0) {
             text = "No failed attempts.";
-        } else if ((failed_attempts % 10 == 1) && (failed_attempts % 100 != 11)) {
-            text = malloc(INFO_MAXLENGTH);
-            snprintf(text, INFO_MAXLENGTH, "%i failed attempt.", failed_attempts);
+        } else if (failed_attempts == 1) {
+            text = "1 failed attempt.";
         } else {
             text = malloc(INFO_MAXLENGTH);
             snprintf(text, INFO_MAXLENGTH, "%i failed attempts.", failed_attempts);
@@ -218,7 +217,7 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
         cairo_show_text(ctx, text);
         cairo_close_path(ctx);
 
-        if (failed_attempts > 0)
+        if (failed_attempts > 1)
             free(text);
 
         /* Lock time (above) */
