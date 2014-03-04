@@ -1,7 +1,7 @@
 /*
  * vim:ts=4:sw=4:expandtab
  *
- * © 2010-2012 Michael Stapelberg
+ * © 2010-2013 Michael Stapelberg
  *
  * See LICENSE for licensing information
  *
@@ -60,6 +60,7 @@ static struct xkb_keymap *xkb_keymap;
 
 cairo_surface_t *img = NULL;
 bool tile = false;
+bool ignore_empty_password = false;
 
 int failed_attempts = 0;
 struct tm *lock_time;
@@ -82,6 +83,9 @@ void u8_dec(char *s, int *i) {
  *
  * Ideally, xkbcommon would ship something like this itself, but as of now
  * (version 0.2.0), it doesn’t.
+ *
+ * TODO: Once xcb-xkb is enabled by default and released, we should port this
+ * code to xcb-xkb. See also https://github.com/xkbcommon/libxkbcommon/issues/1
  *
  */
 static bool load_keymap(void) {
@@ -128,6 +132,16 @@ static bool load_keymap(void) {
         fprintf(stderr, "[i3lock] xkb_state_new failed\n");
         goto out;
     }
+
+    /* Get the initial modifier state to be in sync with the X server.
+     * See https://github.com/xkbcommon/libxkbcommon/issues/1 for why we ignore
+     * the base and latched fields. */
+    XkbStateRec state_rec;
+    XkbGetState(display, XkbUseCoreKbd, &state_rec);
+
+    xkb_state_update_mask(new_state,
+        0, 0, state_rec.locked_mods,
+        0, 0, state_rec.locked_group);
 
     if (xkb_state != NULL)
         xkb_state_unref(xkb_state);
@@ -201,6 +215,10 @@ static void input_done(void) {
     if (pam_authenticate(pam_handle, 0) == PAM_SUCCESS) {
         DEBUG("successfully authenticated\n");
         clear_password_memory();
+        /* Turn the screen on, as it may have been turned off
+         * on release of the 'enter' key. */
+        if (dpms)
+            dpms_set_mode(conn, XCB_DPMS_DPMS_MODE_ON);
         exit(0);
     }
 
@@ -272,6 +290,10 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     case XKB_KEY_Return:
     case XKB_KEY_KP_Enter:
     case XKB_KEY_XF86ScreenSaver:
+        if (ignore_empty_password && input_position == 0) {
+            clear_input();
+            return;
+        }
         password[input_position] = '\0';
         unlock_state = STATE_KEY_PRESSED;
         redraw_screen();
@@ -351,7 +373,8 @@ static void handle_key_press(xcb_key_press_event_t *event) {
  * hiding us) gets hidden.
  *
  */
-static void handle_visibility_notify(xcb_visibility_notify_event_t *event) {
+static void handle_visibility_notify(xcb_connection_t *conn,
+    xcb_visibility_notify_event_t *event) {
     if (event->state != XCB_VISIBILITY_UNOBSCURED) {
         uint32_t values[] = { XCB_STACK_MODE_ABOVE };
         xcb_configure_window(conn, event->window, XCB_CONFIG_WINDOW_STACK_MODE, values);
@@ -483,12 +506,12 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                 /* If this was the backspace or escape key we are back at an
                  * empty input, so turn off the screen if DPMS is enabled */
                 if (dpms && input_position == 0)
-                    dpms_turn_off_screen(conn);
+                    dpms_set_mode(conn, XCB_DPMS_DPMS_MODE_OFF);
 
                 break;
 
             case XCB_VISIBILITY_NOTIFY:
-                handle_visibility_notify((xcb_visibility_notify_event_t*)event);
+                handle_visibility_notify(conn, (xcb_visibility_notify_event_t*)event);
                 break;
 
             case XCB_MAP_NOTIFY:
@@ -518,6 +541,63 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
     }
 }
 
+/*
+ * This function is called from a fork()ed child and will raise the i3lock
+ * window when the window is obscured, even when the main i3lock process is
+ * blocked due to PAM.
+ *
+ */
+static void raise_loop(xcb_window_t window) {
+    xcb_connection_t *conn;
+    xcb_generic_event_t *event;
+    int screens;
+
+    if ((conn = xcb_connect(NULL, &screens)) == NULL ||
+        xcb_connection_has_error(conn))
+        errx(EXIT_FAILURE, "Cannot open display\n");
+
+    /* We need to know about the window being obscured or getting destroyed. */
+    xcb_change_window_attributes(conn, window, XCB_CW_EVENT_MASK,
+        (uint32_t[]){
+            XCB_EVENT_MASK_VISIBILITY_CHANGE |
+            XCB_EVENT_MASK_STRUCTURE_NOTIFY
+        });
+    xcb_flush(conn);
+
+    DEBUG("Watching window 0x%08x\n", window);
+    while ((event = xcb_wait_for_event(conn)) != NULL) {
+        if (event->response_type == 0) {
+            xcb_generic_error_t *error = (xcb_generic_error_t*)event;
+            DEBUG("X11 Error received! sequence 0x%x, error_code = %d\n",
+                 error->sequence, error->error_code);
+            free(event);
+            continue;
+        }
+        /* Strip off the highest bit (set if the event is generated) */
+        int type = (event->response_type & 0x7F);
+        DEBUG("Read event of type %d\n", type);
+        switch (type) {
+            case XCB_VISIBILITY_NOTIFY:
+                handle_visibility_notify(conn, (xcb_visibility_notify_event_t*)event);
+                break;
+            case XCB_UNMAP_NOTIFY:
+                DEBUG("UnmapNotify for 0x%08x\n", (((xcb_unmap_notify_event_t*)event)->window));
+                if (((xcb_unmap_notify_event_t*)event)->window == window)
+                    exit(EXIT_SUCCESS);
+                break;
+            case XCB_DESTROY_NOTIFY:
+                DEBUG("DestroyNotify for 0x%08x\n", (((xcb_destroy_notify_event_t*)event)->window));
+                if (((xcb_destroy_notify_event_t*)event)->window == window)
+                    exit(EXIT_SUCCESS);
+                break;
+            default:
+                DEBUG("Unhandled event type %d\n", type);
+                break;
+        }
+        free(event);
+    }
+}
+
 int main(int argc, char *argv[]) {
     char *username;
     char *image_path = NULL;
@@ -538,13 +618,14 @@ int main(int argc, char *argv[]) {
         {"no-unlock-indicator", no_argument, NULL, 'u'},
         {"image", required_argument, NULL, 'i'},
         {"tiling", no_argument, NULL, 't'},
+        {"ignore-empty-password", no_argument, NULL, 'e'},
         {NULL, no_argument, NULL, 0}
     };
 
     if ((username = getenv("USER")) == NULL)
         errx(1, "USER environment variable not set, please set it.\n");
 
-    while ((o = getopt_long(argc, argv, "hvnbdc:p:ui:t", longopts, &optind)) != -1) {
+    while ((o = getopt_long(argc, argv, "hvnbdc:p:ui:te", longopts, &optind)) != -1) {
         switch (o) {
         case 'v':
             errx(EXIT_SUCCESS, "version " VERSION " © 2010-2012 Michael Stapelberg");
@@ -587,13 +668,16 @@ int main(int argc, char *argv[]) {
                 errx(1, "i3lock: Invalid pointer type given. Expected one of \"win\" or \"default\".\n");
             }
             break;
+        case 'e':
+            ignore_empty_password = true;
+            break;
         case 0:
             if (strcmp(longopts[optind].name, "debug") == 0)
                 debug_mode = true;
             break;
         default:
             errx(1, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
-            " [-i image.png] [-t]"
+            " [-i image.png] [-t] [-e]"
             );
         }
     }
@@ -683,12 +767,28 @@ int main(int argc, char *argv[]) {
     win = open_fullscreen_window(conn, screen, color, bg_pixmap);
     xcb_free_pixmap(conn, bg_pixmap);
 
+    pid_t pid = fork();
+    /* The pid == -1 case is intentionally ignored here:
+     * While the child process is useful for preventing other windows from
+     * popping up while i3lock blocks, it is not critical. */
+    if (pid == 0) {
+        /* Child */
+        close(xcb_get_file_descriptor(conn));
+        raise_loop(win);
+        exit(EXIT_SUCCESS);
+    }
+
     cursor = create_cursor(conn, screen, win, curs_choice);
 
     grab_pointer_and_keyboard(conn, screen, cursor);
+    /* Load the keymap again to sync the current modifier state. Since we first
+     * loaded the keymap, there might have been changes, but starting from now,
+     * we should get all key presses/releases due to having grabbed the
+     * keyboard. */
+    (void)load_keymap();
 
     if (dpms)
-        dpms_turn_off_screen(conn);
+        dpms_set_mode(conn, XCB_DPMS_DPMS_MODE_OFF);
 
     /* Initialize the libev event loop. */
     main_loop = EV_DEFAULT;
