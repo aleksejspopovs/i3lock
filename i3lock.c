@@ -34,9 +34,19 @@
 #include "unlock_indicator.h"
 #include "xinerama.h"
 
+#define TSTAMP_N_SECS(n) (n * 1.0)
+#define TSTAMP_N_MINS(n) (60 * TSTAMP_N_SECS(n))
+#define START_TIMER(timer_obj, timeout, callback) \
+    timer_obj = start_timer(timer_obj, timeout, callback)
+#define STOP_TIMER(timer_obj) \
+    timer_obj = stop_timer(timer_obj)
+
+typedef void (*ev_callback_t)(EV_P_ ev_timer *w, int revents);
+
 /* We need this for libxkbfile */
 static Display *display;
 char color[7] = "ffffff";
+int inactivity_timeout = 30;
 uint32_t last_resolution[2];
 xcb_window_t win;
 static xcb_cursor_t cursor;
@@ -51,6 +61,9 @@ bool unlock_indicator = true;
 static bool dont_fork = false;
 struct ev_loop *main_loop;
 static struct ev_timer *clear_pam_wrong_timeout;
+static struct ev_timer *clear_indicator_timeout;
+static struct ev_timer *dpms_timeout;
+static struct ev_timer *discard_passwd_timeout;
 extern unlock_state_t unlock_state;
 extern pam_state_t pam_state;
 
@@ -61,6 +74,7 @@ static struct xkb_keymap *xkb_keymap;
 cairo_surface_t *img = NULL;
 bool tile = false;
 bool ignore_empty_password = false;
+bool skip_repeated_empty_password = false;
 
 int failed_attempts = 0;
 struct tm *lock_time;
@@ -74,6 +88,16 @@ struct tm *lock_time;
  */
 void u8_dec(char *s, int *i) {
     (void)(isutf(s[--(*i)]) || isutf(s[--(*i)]) || isutf(s[--(*i)]) || --(*i));
+}
+
+static void turn_monitors_on(void) {
+    if (dpms)
+        dpms_set_mode(conn, XCB_DPMS_DPMS_MODE_ON);
+}
+
+static void turn_monitors_off(void) {
+    if (dpms)
+        dpms_set_mode(conn, XCB_DPMS_DPMS_MODE_OFF);
 }
 
 /*
@@ -171,9 +195,33 @@ static void clear_password_memory(void) {
         vpassword[c] = c + (int)beep;
 }
 
+ev_timer* start_timer(ev_timer *timer_obj, ev_tstamp timeout, ev_callback_t callback) {
+    if (timer_obj) {
+        ev_timer_stop(main_loop, timer_obj);
+        ev_timer_set(timer_obj, timeout, 0.);
+        ev_timer_start(main_loop, timer_obj);
+    } else {
+        /* When there is no memory, we just don’t have a timeout. We cannot
+         * exit() here, since that would effectively unlock the screen. */
+        timer_obj = calloc(sizeof(struct ev_timer), 1);
+        if (timer_obj) {
+            ev_timer_init(timer_obj, callback, timeout, 0.);
+            ev_timer_start(main_loop, timer_obj);
+        }
+    }
+    return timer_obj;
+}
+
+ev_timer* stop_timer(ev_timer *timer_obj) {
+    if (timer_obj) {
+        ev_timer_stop(main_loop, timer_obj);
+        free(timer_obj);
+    }
+    return NULL;
+}
 
 /*
- * Resets pam_state to STATE_PAM_IDLE 2 seconds after an unsuccesful
+ * Resets pam_state to STATE_PAM_IDLE 2 seconds after an unsuccessful
  * authentication event.
  *
  */
@@ -184,9 +232,12 @@ static void clear_pam_wrong(EV_P_ ev_timer *w, int revents) {
     redraw_screen();
 
     /* Now free this timeout. */
-    ev_timer_stop(main_loop, clear_pam_wrong_timeout);
-    free(clear_pam_wrong_timeout);
-    clear_pam_wrong_timeout = NULL;
+    STOP_TIMER(clear_pam_wrong_timeout);
+}
+
+static void clear_indicator_cb(EV_P_ ev_timer *w, int revents) {
+    clear_indicator();
+    STOP_TIMER(clear_indicator_timeout);
 }
 
 static void clear_input(void) {
@@ -196,19 +247,27 @@ static void clear_input(void) {
 
     /* Hide the unlock indicator after a bit if the password buffer is
      * empty. */
-    start_clear_indicator_timeout();
+    START_TIMER(clear_indicator_timeout, 1.0, clear_indicator_cb);
     unlock_state = STATE_BACKSPACE_ACTIVE;
     redraw_screen();
     unlock_state = STATE_KEY_PRESSED;
 }
 
-static void input_done(void) {
-    if (clear_pam_wrong_timeout) {
-        ev_timer_stop(main_loop, clear_pam_wrong_timeout);
-        free(clear_pam_wrong_timeout);
-        clear_pam_wrong_timeout = NULL;
-    }
+static void turn_off_monitors_cb(EV_P_ ev_timer *w, int revents) {
+    if (input_position == 0)
+        turn_monitors_off();
 
+    STOP_TIMER(dpms_timeout);
+}
+
+static void discard_passwd_cb(EV_P_ ev_timer *w, int revents) {
+    clear_input();
+    turn_monitors_off();
+    STOP_TIMER(discard_passwd_timeout);
+}
+
+static void input_done(void) {
+    STOP_TIMER(clear_pam_wrong_timeout);
     pam_state = STATE_PAM_VERIFY;
     redraw_screen();
 
@@ -217,8 +276,7 @@ static void input_done(void) {
         clear_password_memory();
         /* Turn the screen on, as it may have been turned off
          * on release of the 'enter' key. */
-        if (dpms)
-            dpms_set_mode(conn, XCB_DPMS_DPMS_MODE_ON);
+        turn_monitors_on();
         exit(0);
     }
 
@@ -234,14 +292,11 @@ static void input_done(void) {
     /* Clear this state after 2 seconds (unless the user enters another
      * password during that time). */
     ev_now_update(main_loop);
-    if ((clear_pam_wrong_timeout = calloc(sizeof(struct ev_timer), 1))) {
-        ev_timer_init(clear_pam_wrong_timeout, clear_pam_wrong, 2.0, 0.);
-        ev_timer_start(main_loop, clear_pam_wrong_timeout);
-    }
+    START_TIMER(clear_pam_wrong_timeout, TSTAMP_N_SECS(2), clear_pam_wrong);
 
     /* Cancel the clear_indicator_timeout, it would hide the unlock indicator
      * too early. */
-    stop_clear_indicator_timeout();
+    STOP_TIMER(clear_indicator_timeout);
 
     /* beep on authentication failure, if enabled */
     if (beep) {
@@ -261,9 +316,17 @@ static void handle_key_release(xcb_key_release_event_t *event) {
 
 static void redraw_timeout(EV_P_ ev_timer *w, int revents) {
     redraw_screen();
+    STOP_TIMER(w);
+}
 
-    ev_timer_stop(main_loop, w);
-    free(w);
+static bool skip_without_validation(void) {
+    if (input_position != 0)
+        return false;
+
+    if (skip_repeated_empty_password || ignore_empty_password)
+        return true;
+
+    return false;
 }
 
 /*
@@ -290,7 +353,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     case XKB_KEY_Return:
     case XKB_KEY_KP_Enter:
     case XKB_KEY_XF86ScreenSaver:
-        if (ignore_empty_password && input_position == 0) {
+        if (skip_without_validation()) {
             clear_input();
             return;
         }
@@ -298,8 +361,13 @@ static void handle_key_press(xcb_key_press_event_t *event) {
         unlock_state = STATE_KEY_PRESSED;
         redraw_screen();
         input_done();
+        skip_repeated_empty_password = true;
         return;
+    default:
+        skip_repeated_empty_password = false;
+    }
 
+    switch (ksym) {
     case XKB_KEY_u:
         if (ctrl) {
             DEBUG("C-u pressed\n");
@@ -322,7 +390,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
 
         /* Hide the unlock indicator after a bit if the password buffer is
          * empty. */
-        start_clear_indicator_timeout();
+        START_TIMER(clear_indicator_timeout, 1.0, clear_indicator_cb);
         unlock_state = STATE_BACKSPACE_ACTIVE;
         redraw_screen();
         unlock_state = STATE_KEY_PRESSED;
@@ -355,13 +423,10 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     redraw_screen();
     unlock_state = STATE_KEY_PRESSED;
 
-    struct ev_timer *timeout = calloc(sizeof(struct ev_timer), 1);
-    if (timeout) {
-        ev_timer_init(timeout, redraw_timeout, 0.25, 0.);
-        ev_timer_start(main_loop, timeout);
-    }
-
-    stop_clear_indicator_timeout();
+    struct ev_timer *timeout = NULL;
+    START_TIMER(timeout, TSTAMP_N_SECS(0.25), redraw_timeout);
+    STOP_TIMER(clear_indicator_timeout);
+    START_TIMER(discard_passwd_timeout, TSTAMP_N_MINS(3), discard_passwd_cb);
 }
 
 /*
@@ -504,10 +569,11 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                 handle_key_release((xcb_key_release_event_t*)event);
 
                 /* If this was the backspace or escape key we are back at an
-                 * empty input, so turn off the screen if DPMS is enabled */
-                if (dpms && input_position == 0)
-                    dpms_set_mode(conn, XCB_DPMS_DPMS_MODE_OFF);
-
+                 * empty input, so turn off the screen if DPMS is enabled, but
+                 * only do that after some timeout: maybe user mistyped and
+                 * will type again right away */
+                START_TIMER(dpms_timeout, TSTAMP_N_SECS(inactivity_timeout),
+                            turn_off_monitors_cb);
                 break;
 
             case XCB_VISIBILITY_NOTIFY:
@@ -619,13 +685,15 @@ int main(int argc, char *argv[]) {
         {"image", required_argument, NULL, 'i'},
         {"tiling", no_argument, NULL, 't'},
         {"ignore-empty-password", no_argument, NULL, 'e'},
+        {"inactivity-timeout", required_argument, NULL, 'I'},
         {NULL, no_argument, NULL, 0}
     };
 
     if ((username = getenv("USER")) == NULL)
-        errx(1, "USER environment variable not set, please set it.\n");
+        errx(EXIT_FAILURE, "USER environment variable not set, please set it.\n");
 
-    while ((o = getopt_long(argc, argv, "hvnbdc:p:ui:te", longopts, &optind)) != -1) {
+    char *optstring = "hvnbdc:p:ui:teI:";
+    while ((o = getopt_long(argc, argv, optstring, longopts, &optind)) != -1) {
         switch (o) {
         case 'v':
             errx(EXIT_SUCCESS, "version " VERSION " © 2010-2012 Michael Stapelberg");
@@ -638,6 +706,13 @@ int main(int argc, char *argv[]) {
         case 'd':
             dpms = true;
             break;
+        case 'I': {
+            int time = 0;
+            if (sscanf(optarg, "%d", &time) != 1 || time < 0)
+                errx(EXIT_FAILURE, "invalid timeout, it must be a positive integer\n");
+            inactivity_timeout = time;
+            break;
+        }
         case 'c': {
             char *arg = optarg;
 
@@ -646,7 +721,7 @@ int main(int argc, char *argv[]) {
                 arg++;
 
             if (strlen(arg) != 6 || sscanf(arg, "%06[0-9a-fA-F]", color) != 1)
-                errx(1, "color is invalid, it must be given in 3-byte hexadecimal format: rrggbb\n");
+                errx(EXIT_FAILURE, "color is invalid, it must be given in 3-byte hexadecimal format: rrggbb\n");
 
             break;
         }
@@ -665,7 +740,7 @@ int main(int argc, char *argv[]) {
             } else if (!strcmp(optarg, "default")) {
                 curs_choice = CURS_DEFAULT;
             } else {
-                errx(1, "i3lock: Invalid pointer type given. Expected one of \"win\" or \"default\".\n");
+                errx(EXIT_FAILURE, "i3lock: Invalid pointer type given. Expected one of \"win\" or \"default\".\n");
             }
             break;
         case 'e':
@@ -676,8 +751,8 @@ int main(int argc, char *argv[]) {
                 debug_mode = true;
             break;
         default:
-            errx(1, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
-            " [-i image.png] [-t] [-e]"
+            errx(EXIT_FAILURE, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
+            " [-i image.png] [-t] [-e] [-I]"
             );
         }
     }
@@ -787,8 +862,7 @@ int main(int argc, char *argv[]) {
      * keyboard. */
     (void)load_keymap();
 
-    if (dpms)
-        dpms_set_mode(conn, XCB_DPMS_DPMS_MODE_OFF);
+    turn_monitors_off();
 
     /* Initialize the libev event loop. */
     main_loop = EV_DEFAULT;

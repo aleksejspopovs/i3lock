@@ -1,7 +1,7 @@
 /*
  * vim:ts=4:sw=4:expandtab
  *
- * © 2010-2012 Michael Stapelberg
+ * © 2010-2014 Michael Stapelberg
  *
  * See LICENSE for licensing information
  *
@@ -9,12 +9,14 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <math.h>
 #include <xcb/xcb.h>
 #include <ev.h>
 #include <cairo.h>
 #include <cairo/cairo-xcb.h>
 
+#include "i3lock.h"
 #include "xcb.h"
 #include "unlock_indicator.h"
 #include "xinerama.h"
@@ -32,12 +34,11 @@
  * Variables defined in i3lock.c.
  ******************************************************************************/
 
+extern bool debug_mode;
+
 /* The current position in the input buffer. Useful to determine if any
  * characters of the password have already been entered or not. */
 int input_position;
-
-/* The ev main loop. */
-struct ev_loop *main_loop;
 
 /* The lock window. */
 extern xcb_window_t win;
@@ -63,10 +64,15 @@ extern int failed_attempts;
 extern struct tm *lock_time;
 
 /*******************************************************************************
- * Local variables.
+ * Variables defined in xcb.c.
  ******************************************************************************/
 
-static struct ev_timer *clear_indicator_timeout;
+/* The root screen, to determine the DPI. */
+extern xcb_screen_t *screen;
+
+/*******************************************************************************
+ * Local variables.
+ ******************************************************************************/
 
 /* Cache the screen’s visual, necessary for creating a Cairo context. */
 static xcb_visualtype_t *vistype;
@@ -77,12 +83,26 @@ unlock_state_t unlock_state;
 pam_state_t pam_state;
 
 /*
+ * Returns the scaling factor of the current screen. E.g., on a 227 DPI MacBook
+ * Pro 13" Retina screen, the scaling factor is 227/96 = 2.36.
+ *
+ */
+static double scaling_factor(void) {
+    const int dpi = (double)screen->height_in_pixels * 25.4 /
+                    (double)screen->height_in_millimeters;
+    return (dpi / 96.0);
+}
+
+/*
  * Draws global image with fill color onto a pixmap with the given
  * resolution and returns it.
  *
  */
 xcb_pixmap_t draw_image(uint32_t *resolution) {
     xcb_pixmap_t bg_pixmap = XCB_NONE;
+    int button_diameter_physical = ceil(scaling_factor() * BUTTON_DIAMETER);
+    DEBUG("scaling_factor is %.f, physical diameter is %d px\n",
+          scaling_factor(), button_diameter_physical);
 
     if (!vistype)
         vistype = get_root_visual_type(screen);
@@ -90,7 +110,7 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
     /* Initialize cairo: Create one in-memory surface to render the unlock
      * indicator on, create one XCB surface to actually draw (one or more,
      * depending on the amount of screens) unlock indicators on. */
-    cairo_surface_t *output = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, BUTTON_DIAMETER, BUTTON_DIAMETER);
+    cairo_surface_t *output = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, button_diameter_physical, button_diameter_physical);
     cairo_t *ctx = cairo_create(output);
 
     cairo_surface_t *xcb_output = cairo_xcb_surface_create(conn, bg_pixmap, vistype, resolution[0], resolution[1]);
@@ -123,6 +143,7 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
     }
 
     if (unlock_state >= STATE_KEY_PRESSED && unlock_indicator) {
+        cairo_scale(ctx, scaling_factor(), scaling_factor());
         /* Draw a (centered) circle with transparent background. */
         cairo_set_line_width(ctx, 10.0);
         cairo_arc(ctx,
@@ -279,20 +300,20 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
     if (xr_screens > 0) {
         /* Composite the unlock indicator in the middle of each screen. */
         for (int screen = 0; screen < xr_screens; screen++) {
-            int x = (xr_resolutions[screen].x + ((xr_resolutions[screen].width / 2) - (BUTTON_DIAMETER / 2)));
-            int y = (xr_resolutions[screen].y + ((xr_resolutions[screen].height / 2) - (BUTTON_DIAMETER / 2)));
+            int x = (xr_resolutions[screen].x + ((xr_resolutions[screen].width / 2) - (button_diameter_physical / 2)));
+            int y = (xr_resolutions[screen].y + ((xr_resolutions[screen].height / 2) - (button_diameter_physical / 2)));
             cairo_set_source_surface(xcb_ctx, output, x, y);
-            cairo_rectangle(xcb_ctx, x, y, BUTTON_DIAMETER, BUTTON_DIAMETER);
+            cairo_rectangle(xcb_ctx, x, y, button_diameter_physical, button_diameter_physical);
             cairo_fill(xcb_ctx);
         }
     } else {
         /* We have no information about the screen sizes/positions, so we just
          * place the unlock indicator in the middle of the X root window and
          * hope for the best. */
-        int x = (last_resolution[0] / 2) - (BUTTON_DIAMETER / 2);
-        int y = (last_resolution[1] / 2) - (BUTTON_DIAMETER / 2);
+        int x = (last_resolution[0] / 2) - (button_diameter_physical / 2);
+        int y = (last_resolution[1] / 2) - (button_diameter_physical / 2);
         cairo_set_source_surface(xcb_ctx, output, x, y);
-        cairo_rectangle(xcb_ctx, x, y, BUTTON_DIAMETER, BUTTON_DIAMETER);
+        cairo_rectangle(xcb_ctx, x, y, button_diameter_physical, button_diameter_physical);
         cairo_fill(xcb_ctx);
     }
 
@@ -322,45 +343,9 @@ void redraw_screen(void) {
  * password buffer.
  *
  */
-static void clear_indicator(EV_P_ ev_timer *w, int revents) {
+void clear_indicator(void) {
     if (input_position == 0) {
         unlock_state = STATE_STARTED;
     } else unlock_state = STATE_KEY_PRESSED;
     redraw_screen();
-
-    ev_timer_stop(main_loop, clear_indicator_timeout);
-    free(clear_indicator_timeout);
-    clear_indicator_timeout = NULL;
-}
-
-/*
- * (Re-)starts the clear_indicator timeout. Called after pressing backspace or
- * after an unsuccessful authentication attempt.
- *
- */
-void start_clear_indicator_timeout(void) {
-    if (clear_indicator_timeout) {
-        ev_timer_stop(main_loop, clear_indicator_timeout);
-        ev_timer_set(clear_indicator_timeout, 1.0, 0.);
-        ev_timer_start(main_loop, clear_indicator_timeout);
-    } else {
-        /* When there is no memory, we just don’t have a timeout. We cannot
-         * exit() here, since that would effectively unlock the screen. */
-        if (!(clear_indicator_timeout = calloc(sizeof(struct ev_timer), 1)))
-            return;
-        ev_timer_init(clear_indicator_timeout, clear_indicator, 1.0, 0.);
-        ev_timer_start(main_loop, clear_indicator_timeout);
-    }
-}
-
-/*
- * Stops the clear_indicator timeout.
- *
- */
-void stop_clear_indicator_timeout(void) {
-    if (clear_indicator_timeout) {
-        ev_timer_stop(main_loop, clear_indicator_timeout);
-        free(clear_indicator_timeout);
-        clear_indicator_timeout = NULL;
-    }
 }
